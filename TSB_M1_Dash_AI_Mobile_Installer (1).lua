@@ -1,30 +1,14 @@
--- TSB M1 + DASH AI -- MOBILE VARIANT -- INSTALLER + RUNNER (M6)
+-- TSB M1 + DASH AI -- INSTALLER + RUNNER (R23)
 -- The only file you need. Execute it every time:
 --   workspace copy missing   -> installs it, runs
 --   workspace copy different -> replaces it, runs
 --   workspace copy identical -> runs from the file
 -- Persistence (queue_on_teleport) reuses the exact source that ran.
-local FILE = "TSB_M1_Dash_AI_Mobile.lua"
+local FILE = "TSB_M1_Dash_AI.lua"
 local BODY = [=========[
--- TSB M1 + DASH AI MK.1 -- MOBILE VARIANT (M6, based on REV R22)
--- M6: signed pixel offset for every mobile touchpoint; focused live preview;
---     saves in the mobile layout file and reloads after an automatic rejoin.
--- M5: shared presser (OBJECT under/nearest the point, GLOBAL fake touch to
---     the game's own input listeners, TOUCH last resort), per-button method
---     from the calibrator; latest calibration built in.
--- M4: button lookup skips handler-less layers (the full-screen
---     Hotbar.Backpack frame was being picked for every button); TouchTap added.
--- M3: real mobile input type (UserInputService reads as touch for the game)
---     + buttons pressed through their own handlers: no virtual pointer, no
---     cursor, several buttons can be held at once. Pointer touch = fallback.
--- Same brain as the PC build. Input layer swapped:
---   movement  -> virtual W/A/S/D state -> Humanoid:Move(camera-relative),
---                identical to what the keyboard control module produces (M2)
---   facing    -> shift lock emulated (root yaw follows the camera)
---   Q / F / Space / 1-4 -> touches on the calibrated mobile buttons
---                (TSB_AI_mobile_layout.json, built-in default = your calibration)
---   tools     -> external watchdog unequips any tool left equipped
--- REV R22 notes follow.
+-- TSB M1 + DASH AI MK.1 (Reactive Consolidated) -- REV R23
+-- R23: signed attack touchpoint Y offset, focused live preview, and saved
+--      offset restored from the executor file after an automatic rejoin.
 -- R22: thumbstick drag goes fully outside the stick circle and releases
 --     out there (no return to center); random tap loop unchanged.
 -- R21: while dead, nonstop thumbstick drags + random touch taps near the
@@ -261,18 +245,12 @@ local CONFIG = {
 
     -- R6: persistence / autostart / rejoin
     PersistEnabled = true,     -- re-queue this script on every teleport
-    ScriptFile = "TSB_M1_Dash_AI_Mobile.lua", -- executor workspace copy of THIS file
+    ScriptFile = "TSB_M1_Dash_AI.lua", -- executor workspace copy of THIS file
     ScriptUrl = "",            -- optional raw URL fallback (HttpGet)
     AutoStartDelay = 1.0,      -- after an auto-load, before the self reset (R13: was 3.0)
     AutoEnableDelay = 0.5,     -- after respawn, before the AI switches on (R13: was 1.5)
     EmbedSourceInQueue = true, -- R13: queue our own source text (IY-style, no file read after teleport)
-    AutoShiftLock = false,     -- mobile: shift lock is emulated instead
-    MobileLayoutFile = "TSB_AI_mobile_layout.json",
-    EmulateShiftLock = true,   -- root yaw follows the camera while the AI runs
-    ToolWatchdog = true,       -- unequip tools the AI did not mean to hold
-    ToolUnexpectedGrace = 0.35,
-    SpoofTouchInput = true,    -- M3: game sees a touch device (no virtual pointer, no cursor)
-    DirectButtons = true,      -- M3: press mobile buttons through their own handlers
+    AutoShiftLock = true,      -- make sure shift lock is on after auto start
     RejoinOnDeath = true,      -- auto-started session: death rejoins the same server
     -- R6: team roles + file comms
     CutOffLead = 7,            -- flanker aims this far ahead of a running target
@@ -286,6 +264,7 @@ local CONFIG = {
     HideLeaderboard = true,    -- R14: player list off so it does not block the screen
     MobileControlsOnReset = true, -- R18: touch input during reset so the respawn builds mobile buttons
     MobileTouchPoint = {0.5, 0.18}, -- R18: screen fraction for the harmless touch pulses (empty sky area)
+    AttackYOffsetFile = "TSB_AI_attack_touch_offset.json",
     MobileHoldAfterSpawn = 1.0,  -- R18: keep pulsing this long after the new character appears
     ThumbstickPoint = {0.15, 0.78}, -- R20: fallback thumbstick zone (screen fraction, bottom-left)
     ThumbstickDragDistance = 120,   -- R22: minimum drag length in pixels
@@ -657,6 +636,8 @@ local OwnRagdollEscapeKind
 -- R1 state and functions live in two tables to stay under the Luau
 -- 200-local limit of the main chunk.
 local RS = {
+    AttackYOffsetPx = 0,
+    AttackOffsetPreviewConnection = nil,
     ThreatWatches = {},        -- [track] = watch
     ThreatLock = nil,
     TargetBlockEndedAt = -math.huge,
@@ -710,454 +691,40 @@ local RS = {
 }
 local RF = {}
 
--- ===================== MOBILE: layout + input mapping =====================
--- Default = the calibration you sent (1180x820); the workspace file wins.
-RS.MobileYOffsetPx = 0 -- positive moves touchpoints up; negative moves them down
-RS.MobileLayout = {
-    Move1 = {fx = 0.4144, fy = 0.8890, mode = "CLICK"},
-    Move2 = {fx = 0.4737, fy = 0.8927, mode = "CLICK"},
-    Move3 = {fx = 0.5297, fy = 0.8927, mode = "CLICK"},
-    Move4 = {fx = 0.5856, fy = 0.8927, mode = "CLICK"},
-    Block = {fx = 0.9161, fy = 0.2963, mode = "HOLD"},
-    Dash = {fx = 0.9025, fy = 0.6049, mode = "CLICK"},
-    Attack = {fx = 0.9110, fy = 0.4683, mode = "CLICK"},
-    Jump = {fx = 0.9051, fy = 0.7524, mode = "CLICK"},
-}
-RS.MobileKeyButton = {
-    [Enum.KeyCode.Q] = "Dash", [Enum.KeyCode.F] = "Block", [Enum.KeyCode.Space] = "Jump",
-    [Enum.KeyCode.One] = "Move1", [Enum.KeyCode.Two] = "Move2",
-    [Enum.KeyCode.Three] = "Move3", [Enum.KeyCode.Four] = "Move4",
-}
-RS.MobileHoldKeys = {[Enum.KeyCode.F] = true, [Enum.KeyCode.Space] = true} -- press-and-hold
-RS.MobileTouchId = {Block = 4, Jump = 5, Dash = 6, Move1 = 7, Move2 = 7, Move3 = 7, Move4 = 7}
-RS.MobileHeld = {}
-RS.MoveVector = Vector3.zero
-RS.VirtualKeys = {}
-RS.MoveInProgress = false
-
-function RF.loadMobileLayout()
+function RF.loadAttackYOffset()
     if type(readfile) ~= "function" then return false end
-    local ok, raw = pcall(readfile, CONFIG.MobileLayoutFile)
+    local ok, raw = pcall(readfile, CONFIG.AttackYOffsetFile)
     if not ok or type(raw) ~= "string" or #raw == 0 then return false end
-    local okJ, layout = pcall(function() return game:GetService("HttpService"):JSONDecode(raw) end)
-    if not okJ or type(layout) ~= "table" or type(layout.buttons) ~= "table" then return false end
-    local savedOffset = tonumber(layout.yOffsetPx)
-    if savedOffset and savedOffset == savedOffset and math.abs(savedOffset) <= 10000 then
-        RS.MobileYOffsetPx = savedOffset
-    end
-    for name, b in pairs(layout.buttons) do
-        if type(b) == "table" and tonumber(b.fx) and tonumber(b.fy) then
-            RS.MobileLayout[name] = {fx = tonumber(b.fx), fy = tonumber(b.fy), mode = b.mode or "CLICK",
-                method = b.method or "AUTO"}
-        end
-    end
+    local okJson, saved = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(raw)
+    end)
+    if not okJson or type(saved) ~= "table" then return false end
+    local value = tonumber(saved.yOffsetPx)
+    if not value or value ~= value or math.abs(value) > 10000 then return false end
+    RS.AttackYOffsetPx = value
     return true
 end
-RF.loadMobileLayout()
 
-function RF.saveMobileLayout()
+function RF.saveAttackYOffset()
     if type(writefile) ~= "function" then return false, "file writing unavailable" end
-    local layout = {
-        version = 2,
-        yOffsetPx = tonumber(RS.MobileYOffsetPx) or 0,
-        buttons = {},
-    }
-    for name, b in pairs(RS.MobileLayout) do
-        layout.buttons[name] = {
-            fx = tonumber(b.fx),
-            fy = tonumber(b.fy),
-            mode = b.mode or "CLICK",
-            method = b.method or "AUTO",
-        }
-    end
     local okEncode, raw = pcall(function()
-        return game:GetService("HttpService"):JSONEncode(layout)
+        return game:GetService("HttpService"):JSONEncode({
+            version = 1,
+            yOffsetPx = tonumber(RS.AttackYOffsetPx) or 0,
+        })
     end)
     if not okEncode then return false, tostring(raw) end
-    local okWrite, writeError = pcall(writefile, CONFIG.MobileLayoutFile, raw)
+    local okWrite, writeError = pcall(writefile, CONFIG.AttackYOffsetFile, raw)
     if not okWrite then return false, tostring(writeError) end
     return true
 end
 
-function RF.mobilePoint(name)
-    local b = RS.MobileLayout[name]
-    local camera = workspace.CurrentCamera
-    local size = camera and camera.ViewportSize or Vector2.new(1180, 820)
-    return Vector2.new(math.floor(b.fx * size.X), math.floor(b.fy * size.Y - (RS.MobileYOffsetPx or 0)))
+function RF.attackPoint()
+    return ATTACK_BUTTON.AbsoluteCenter + ATTACK_BUTTON.InputOffset
+        - Vector2.new(0, RS.AttackYOffsetPx or 0)
 end
 
--- ===================== MOBILE M3: real mobile input type =====================
--- 1) Input-type spoof: game scripts read UserInputService as a touch device
---    (TouchEnabled true, no mouse/keyboard, last input Touch). Our own calls
---    (checkcaller) see the real values. Installed once per session; a shared
---    flag turns it on/off so re-executing never stacks hooks.
-function RF.installTouchSpoof()
-    local env = getgenv and getgenv() or _G
-    env.TSB_AI_TOUCH_SPOOF = env.TSB_AI_TOUCH_SPOOF or {active = false, installed = false}
-    local shared = env.TSB_AI_TOUCH_SPOOF
-    RS.Spoof = shared
-    if not CONFIG.SpoofTouchInput then shared.active = false return false end
-    if shared.installed then shared.active = true return true end
-    if type(hookmetamethod) ~= "function" or type(checkcaller) ~= "function"
-        or type(getnamecallmethod) ~= "function" then
-        return false
-    end
-    local UIS = UserInputService
-    local touchType = Enum.UserInputType.Touch
-    local preferredTouch
-    pcall(function() preferredTouch = Enum.PreferredInput.Touch end)
-    local ok = pcall(function()
-        local oldIndex
-        oldIndex = hookmetamethod(game, "__index", function(self, key)
-            if shared.active and self == UIS and not checkcaller() then
-                if key == "TouchEnabled" then return true end
-                if key == "MouseEnabled" or key == "KeyboardEnabled" or key == "GamepadEnabled" then
-                    return false
-                end
-                if key == "LastInputType" then return touchType end
-                if key == "PreferredInput" and preferredTouch then return preferredTouch end
-            end
-            return oldIndex(self, key)
-        end)
-        local oldNamecall
-        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-            if shared.active and self == UIS and not checkcaller()
-                and getnamecallmethod() == "GetLastInputType" then
-                return touchType
-            end
-            return oldNamecall(self, ...)
-        end)
-    end)
-    shared.installed = ok
-    shared.active = ok
-    return ok
-end
-
-function RF.spoofActive()
-    return RS.Spoof ~= nil and RS.Spoof.installed and RS.Spoof.active
-end
-
--- 2) Direct button presses: find the game's button under the calibrated
---    point and fire its own handlers (no pointer, so any number of buttons
---    can be "held" at once). Falls back to a touch event only if that fails.
-RS.ButtonCache = {}
-RS.ButtonKind = {}
-
-function RF.connectionsOf(signal)
-    if type(getconnections) ~= "function" then return {} end
-    local ok, list = pcall(getconnections, signal)
-    return ok and type(list) == "table" and list or {}
-end
-
-function RF.fireSignal(signal, ...)
-    local fired = false
-    for _, connection in ipairs(RF.connectionsOf(signal)) do
-        local fn = connection.Function
-        if type(fn) == "function" then
-            task.spawn(fn, ...)
-            fired = true
-        elseif connection.Fire then
-            if pcall(connection.Fire, connection, ...) then fired = true end
-        end
-    end
-    return fired
-end
-
-function RF.isOurGui(obj)
-    local screen = obj:FindFirstAncestorOfClass("ScreenGui")
-    return screen ~= nil and (screen == RS.OurGui or screen.Name == "TSB_AI_Calibrator")
-end
-
-function RF.resolveButton(name)
-    local cached = RS.ButtonCache[name]
-    if cached and cached.Parent and cached:IsDescendantOf(game) and cached.Visible then
-        return cached
-    end
-    RS.ButtonCache[name] = nil
-    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if not playerGui then return nil end
-    local p = RF.mobilePoint(name)
-    local inset = game:GetService("GuiService"):GetGuiInset()
-    local ok, list = pcall(function()
-        return playerGui:GetGuiObjectsAtPosition(p.X - inset.X, p.Y - inset.Y)
-    end)
-    if not ok or type(list) ~= "table" then return nil end
-    -- M4: walk down through every layer at the point; skip containers that
-    -- have no handlers (e.g. the full-screen Hotbar.Backpack frame) and take
-    -- the first object that actually listens for presses.
-    for _, obj in ipairs(list) do
-        if not RF.isOurGui(obj) then
-            local kind = RF.buttonKindOf(obj)
-            if kind then
-                RS.ButtonCache[name] = obj
-                RS.ButtonKind[name] = kind
-                return obj
-            end
-        end
-    end
-    return nil
-end
-
-function RF.buttonKindOf(obj)
-    if #RF.connectionsOf(obj.InputBegan) > 0 then return "INPUT" end
-    if obj:IsA("GuiButton") then
-        if #RF.connectionsOf(obj.MouseButton1Down) > 0 then return "MB1" end
-        if #RF.connectionsOf(obj.Activated) > 0 then return "ACTIVATED" end
-        if #RF.connectionsOf(obj.MouseButton1Click) > 0 then return "CLICK" end
-    end
-    if #RF.connectionsOf(obj.TouchTap) > 0 then return "TOUCHTAP" end
-    return nil
-end
-
-function RF.fakeTouch(state, p)
-    return {
-        UserInputType = Enum.UserInputType.Touch,
-        UserInputState = state,
-        KeyCode = Enum.KeyCode.Unknown,
-        Position = Vector3.new(p.X, p.Y, 0),
-        Delta = Vector3.zero,
-    }
-end
-
--- Fires ONE handler family per button (whichever the game actually uses),
--- so a press never triggers twice.
-function RF.directPress(name, state)
-    if not CONFIG.DirectButtons or type(getconnections) ~= "function" then return false end
-    local obj = RF.resolveButton(name)
-    if not obj then return false end
-    local p = RF.mobilePoint(name)
-    local begin = state == Enum.UserInputState.Begin
-    local kind = RS.ButtonKind[name] or RF.buttonKindOf(obj)
-    if not kind then return false end
-    RS.ButtonKind[name] = kind
-    if kind == "INPUT" then
-        return RF.fireSignal(begin and obj.InputBegan or obj.InputEnded, RF.fakeTouch(state, p), false)
-    elseif kind == "MB1" then
-        return RF.fireSignal(begin and obj.MouseButton1Down or obj.MouseButton1Up, p.X, p.Y)
-    elseif kind == "ACTIVATED" then
-        return begin and RF.fireSignal(obj.Activated, RF.fakeTouch(state, p), 1) or true
-    elseif kind == "TOUCHTAP" then
-        return begin and RF.fireSignal(obj.TouchTap, {Vector2.new(p.X, p.Y)}, false) or true
-    else
-        return begin and RF.fireSignal(obj.MouseButton1Click) or true
-    end
-end
-
--- ===== PRESSER (shared by the calibrator and the mobile AI) =====
--- Presses a mobile button WITHOUT moving the pointer. Methods:
---   OBJECT : fire the handlers of the game object under / nearest the point
---   GLOBAL : fire the game's own UserInputService InputBegan/TouchStarted
---            listeners with a fake touch at the point (custom touch buttons)
---   TOUCH  : VirtualInputManager touch event (moves the pointer; last resort)
---   AUTO   : OBJECT if a pressable object is found, else GLOBAL
-function RF.newPresser(isOurs)
-    local P = {}
-    local UIS = game:GetService("UserInputService")
-    local GuiService = game:GetService("GuiService")
-    local VIM = game:GetService("VirtualInputManager")
-    local LocalPlayer = game:GetService("Players").LocalPlayer
-    local state = {} -- name -> {fake, obj, kind, method}
-    P.scanCache = nil
-
-    local function conns(signal)
-        if type(getconnections) ~= "function" then return {} end
-        local ok, list = pcall(getconnections, signal)
-        return ok and type(list) == "table" and list or {}
-    end
-    P.conns = conns
-
-    local function luaCount(signal)
-        local n = 0
-        for _, c in ipairs(conns(signal)) do
-            if type(c.Function) == "function" then n += 1 end
-        end
-        return n
-    end
-    P.luaCount = luaCount
-
-    local function fire(signal, luaOnly, ...)
-        local fired = false
-        for _, c in ipairs(conns(signal)) do
-            if type(c.Function) == "function" then
-                task.spawn(c.Function, ...)
-                fired = true
-            elseif not luaOnly and c.Fire then
-                if pcall(c.Fire, c, ...) then fired = true end
-            end
-        end
-        return fired
-    end
-
-    local function kindOf(obj)
-        if #conns(obj.InputBegan) > 0 then return "INPUT" end
-        if obj:IsA("GuiButton") then
-            if #conns(obj.MouseButton1Down) > 0 then return "MB1" end
-            if #conns(obj.Activated) > 0 then return "ACTIVATED" end
-            if #conns(obj.MouseButton1Click) > 0 then return "CLICK" end
-        end
-        if #conns(obj.TouchTap) > 0 then return "TOUCHTAP" end
-        return nil
-    end
-    P.kindOf = kindOf
-
-    local function shown(obj)
-        local o = obj
-        while o and o:IsA("GuiObject") do
-            if not o.Visible then return false end
-            o = o.Parent
-        end
-        local screen = obj:FindFirstAncestorOfClass("ScreenGui")
-        return not screen or screen.Enabled
-    end
-
-    function P.guiPoint(p)
-        local inset = GuiService:GetGuiInset()
-        return Vector2.new(p.X - inset.X, p.Y - inset.Y)
-    end
-
-    function P.layersAt(p)
-        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-        local g = P.guiPoint(p)
-        local ok, list = pcall(function() return playerGui:GetGuiObjectsAtPosition(g.X, g.Y) end)
-        local out = {}
-        if ok and type(list) == "table" then
-            for _, obj in ipairs(list) do
-                if not isOurs(obj) then table.insert(out, obj) end
-            end
-        end
-        return out
-    end
-
-    -- every visible handler-bearing object in PlayerGui (cached until reset)
-    function P.scan()
-        if P.scanCache then return P.scanCache end
-        local list = {}
-        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-        if playerGui then
-            for _, obj in ipairs(playerGui:GetDescendants()) do
-                if obj:IsA("GuiObject") and not isOurs(obj) and obj.AbsoluteSize.X > 0 then
-                    local kind = kindOf(obj)
-                    if kind then table.insert(list, {obj = obj, kind = kind}) end
-                end
-            end
-        end
-        P.scanCache = list
-        return list
-    end
-
-    function P.resetCache()
-        P.scanCache = nil
-        for _, s in pairs(state) do s.obj = nil end
-    end
-
-    -- object under the point, else the nearest pressable object within 70 px
-    function P.findObject(p)
-        for _, obj in ipairs(P.layersAt(p)) do
-            local kind = kindOf(obj)
-            if kind then return obj, kind, "layer" end
-        end
-        local g = P.guiPoint(p)
-        local best, bestKind, bestScore
-        for _, entry in ipairs(P.scan()) do
-            local obj = entry.obj
-            if obj.Parent and shown(obj) then
-                local pos, size = obj.AbsolutePosition, obj.AbsoluteSize
-                local inside = g.X >= pos.X and g.X <= pos.X + size.X and g.Y >= pos.Y and g.Y <= pos.Y + size.Y
-                local center = pos + size / 2
-                local d = (center - g).Magnitude
-                if inside or d <= 70 then
-                    local score = (inside and 0 or 100000) + size.X * size.Y * 0.001 + d
-                    if not bestScore or score < bestScore then
-                        best, bestKind, bestScore = obj, entry.kind, score
-                    end
-                end
-            end
-        end
-        if best then return best, bestKind, "nearest" end
-        return nil
-    end
-
-    local function fakeTouch(p)
-        local g = P.guiPoint(p)
-        return {
-            UserInputType = Enum.UserInputType.Touch,
-            UserInputState = Enum.UserInputState.Begin,
-            KeyCode = Enum.KeyCode.Unknown,
-            Position = Vector3.new(g.X, g.Y, 0),
-            Delta = Vector3.zero,
-        }
-    end
-
-    -- begin a press; returns the method actually used
-    function P.begin(name, p, method, touchId)
-        method = method or "AUTO"
-        local s = {fake = fakeTouch(p), p = p, touchId = touchId}
-        state[name] = s
-        if method == "AUTO" or method == "OBJECT" then
-            local obj, kind = P.findObject(p)
-            if obj then
-                s.obj, s.kind, s.method = obj, kind, "OBJECT"
-                local f = s.fake
-                if kind == "INPUT" then fire(obj.InputBegan, false, f, false)
-                elseif kind == "MB1" then fire(obj.MouseButton1Down, false, f.Position.X, f.Position.Y)
-                elseif kind == "ACTIVATED" then fire(obj.Activated, false, f, 1)
-                elseif kind == "CLICK" then fire(obj.MouseButton1Click, false)
-                elseif kind == "TOUCHTAP" then fire(obj.TouchTap, false, {Vector2.new(f.Position.X, f.Position.Y)}, false)
-                end
-                return "OBJECT:" .. kind
-            end
-            if method == "OBJECT" then s.method = "NONE" return "OBJECT:none" end
-        end
-        if method == "AUTO" or method == "GLOBAL" then
-            s.method = "GLOBAL"
-            local a = fire(UIS.InputBegan, true, s.fake, false)
-            local b = fire(UIS.TouchStarted, true, s.fake, false)
-            return (a or b) and "GLOBAL" or "GLOBAL:none"
-        end
-        s.method = "TOUCH"
-        pcall(function()
-            VIM:SendTouchEvent(touchId or 9, Enum.UserInputState.Begin, p.X, p.Y, 0)
-        end)
-        return "TOUCH"
-    end
-
-    function P.finish(name)
-        local s = state[name]
-        if not s then return end
-        state[name] = nil
-        s.fake.UserInputState = Enum.UserInputState.End
-        if s.method == "OBJECT" and s.obj then
-            local obj, f = s.obj, s.fake
-            if s.kind == "INPUT" then fire(obj.InputEnded, false, f, false)
-            elseif s.kind == "MB1" then fire(obj.MouseButton1Up, false, f.Position.X, f.Position.Y) end
-        elseif s.method == "GLOBAL" then
-            fire(UIS.InputEnded, true, s.fake, false)
-            fire(UIS.TouchEnded, true, s.fake, false)
-        elseif s.method == "TOUCH" then
-            pcall(function()
-                VIM:SendTouchEvent(s.touchId or 9, Enum.UserInputState.End, s.p.X, s.p.Y, 0)
-            end)
-        end
-    end
-
-    function P.held(name) return state[name] ~= nil end
-    return P
-end
-
--- M5: every button press goes through the presser, using the per-button
--- method saved by the calibrator (AUTO / OBJECT / GLOBAL / TOUCH).
-RF.P = RF.newPresser(function(obj) return RF.isOurGui(obj) end)
-
-function RF.mobileTouch(name, state)
-    if state == Enum.UserInputState.Begin then
-        if RF.P.held(name) then RF.P.finish(name) end
-        local b = RS.MobileLayout[name]
-        RS.LastPressMethod = RF.P.begin(name, RF.mobilePoint(name), b and b.method or "AUTO",
-            RS.MobileTouchId[name] or 8)
-    else
-        RF.P.finish(name)
-    end
-end
+RF.loadAttackYOffset()
 
 local function getCharacterParts()
     Character = LocalPlayer.Character
@@ -1659,35 +1226,9 @@ local function faceTarget(targetRoot, instant)
 end
 
 local function sendKey(key, down)
-    -- MOBILE M2: W/A/S/D are kept as a virtual key state and fed to
-    -- Humanoid:Move exactly like the keyboard control module would
-    -- (camera-relative, same 8 directions, same hysteresis upstream).
-    if key == Enum.KeyCode.W or key == Enum.KeyCode.A or key == Enum.KeyCode.S
-        or key == Enum.KeyCode.D then
-        RS.VirtualKeys[key] = down or nil
-        return
-    end
-    if key == Enum.KeyCode.LeftShift then return end -- shift lock is emulated
-    local name = RS.MobileKeyButton[key]
-    if not name then
-        pcall(function() VirtualInputManager:SendKeyEvent(down, key, false, game) end)
-        return
-    end
-    if RS.MobileHoldKeys[key] or RS.MobileLayout[name].mode == "HOLD" then
-        if down and not RS.MobileHeld[name] then
-            RS.MobileHeld[name] = true
-            RF.mobileTouch(name, Enum.UserInputState.Begin)
-        elseif not down and RS.MobileHeld[name] then
-            RS.MobileHeld[name] = nil
-            RF.mobileTouch(name, Enum.UserInputState.End)
-        end
-    elseif down then
-        task.spawn(function()
-            RF.mobileTouch(name, Enum.UserInputState.Begin)
-            task.wait()
-            RF.mobileTouch(name, Enum.UserInputState.End)
-        end)
-    end
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(down, key, false, game)
+    end)
 end
 
 local HeldMoveKeys = {}
@@ -1855,16 +1396,13 @@ end
 local function attackTap()
     local camera = workspace.CurrentCamera
     if not camera then return false end
-    local point = RF.mobilePoint("Attack") -- MOBILE: calibrated attack button
+    local point = RF.attackPoint()
     local x = math.floor(point.X)
     local y = math.floor(point.Y)
 
-    do -- M5: presser (no pointer unless the Attack method is TOUCH)
-        RF.mobileTouch("Attack", Enum.UserInputState.Begin)
-        task.wait()
-        RF.mobileTouch("Attack", Enum.UserInputState.End)
-        return true
-    end
+    pcall(function()
+        VirtualInputManager:SendMouseMoveEvent(x, y, game)
+    end)
 
     local tap = _G.touchTap or _G.touch_tap or _G.tap or touchTap or touch_tap
     if type(tap) == "function" then
@@ -3390,26 +2928,6 @@ end
 -- No tool / no animation = we were stunned or dead: retry later, never
 -- treated as a cooldown problem.
 function RF.pressMove(slot, token)
-    RS.MoveInProgress = true
-    local ok, result = pcall(RF.pressMoveCore, slot, token)
-    RS.MoveInProgress = false
-    RS.MoveEndedAt = os.clock()
-    if not ok then error(result, 0) end
-    return result
-end
-
--- MOBILE unselect: tap the slot again; if the tool is still held, unequip it
--- externally (Humanoid:UnequipTools), since there are no keys to rely on.
-function RF.unselectMove(move)
-    if not RF.toolEquipped() then return end
-    RF.tapKey(move.key)
-    task.wait(0.1)
-    if RF.toolEquipped() and Humanoid then
-        pcall(function() Humanoid:UnequipTools() end)
-    end
-end
-
-function RF.pressMoveCore(slot, token)
     local move = RS.Moves[slot]
     if not RF.moveReady(slot) or RF.threatLockActive() then return false end
     local function fail(reason)
@@ -3447,7 +2965,10 @@ function RF.pressMoveCore(slot, token)
     end
 
     task.wait(CONFIG.MoveUnselectDelay)
-    RF.unselectMove(move)
+    local mode = CONFIG.MoveUnselectMode
+    if mode == "ALWAYS" or (mode == "IF_EQUIPPED" and RF.toolEquipped()) then
+        RF.tapKey(move.key)
+    end
 
     if not confirmed then return fail("NOT_CONFIRMED") end
     move.lastUsedAt = pressedAt
@@ -4333,7 +3854,6 @@ RS.CharacterAddedConnection = LocalPlayer.CharacterAdded:Connect(setCharacter)
 if LocalPlayer.Character then task.spawn(setCharacter, LocalPlayer.Character) end
 
 local gui = Instance.new("ScreenGui")
-RS.OurGui = gui
 gui.Name = "TSBM1DashAIReactive"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
@@ -4364,7 +3884,7 @@ status.TextSize = 12
 status.Parent = panel
 
 local offsetPanel = Instance.new("Frame")
-offsetPanel.Name = "MobileTouchOffset"
+offsetPanel.Name = "AttackTouchOffset"
 offsetPanel.AnchorPoint = Vector2.new(1, 0.5)
 offsetPanel.Position = UDim2.new(0.82, 0, 0.5, 0)
 offsetPanel.Size = UDim2.fromOffset(154, 72)
@@ -4379,7 +3899,7 @@ offsetTitle.Name = "Title"
 offsetTitle.Size = UDim2.new(1, -8, 0, 18)
 offsetTitle.Position = UDim2.fromOffset(4, 2)
 offsetTitle.BackgroundTransparency = 1
-offsetTitle.Text = "TOUCH Y OFFSET (PX)"
+offsetTitle.Text = "ATTACK Y OFFSET (PX)"
 offsetTitle.TextColor3 = Color3.fromRGB(255, 225, 120)
 offsetTitle.Font = Enum.Font.Code
 offsetTitle.TextSize = 11
@@ -4394,7 +3914,7 @@ offsetBox.Position = UDim2.fromOffset(4, 20)
 offsetBox.BackgroundColor3 = Color3.fromRGB(32, 32, 32)
 offsetBox.BorderColor3 = Color3.fromRGB(120, 120, 120)
 offsetBox.ClearTextOnFocus = false
-offsetBox.Text = tostring(RS.MobileYOffsetPx or 0)
+offsetBox.Text = tostring(RS.AttackYOffsetPx or 0)
 offsetBox.PlaceholderText = "positive = up"
 offsetBox.TextColor3 = Color3.new(1, 1, 1)
 offsetBox.PlaceholderColor3 = Color3.fromRGB(150, 150, 150)
@@ -4417,66 +3937,55 @@ offsetStatus.TextXAlignment = Enum.TextXAlignment.Left
 offsetStatus.ZIndex = 91
 offsetStatus.Parent = offsetPanel
 
-local touchpointPreviewSpecs = {
-    {"Attack", "ATK"}, {"Block", "BLK"}, {"Dash", "DASH"}, {"Jump", "JMP"},
-    {"Move1", "1"}, {"Move2", "2"}, {"Move3", "3"}, {"Move4", "4"},
-}
-local touchpointPreview = {}
-for _, spec in ipairs(touchpointPreviewSpecs) do
-    local marker = Instance.new("Frame")
-    marker.Name = "TouchPreview_" .. spec[1]
-    marker.AnchorPoint = Vector2.new(0.5, 0.5)
-    marker.Size = UDim2.fromOffset(30, 20)
-    marker.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-    marker.BackgroundTransparency = 0.12
-    marker.BorderColor3 = Color3.fromRGB(255, 220, 80)
-    marker.BorderSizePixel = 2
-    marker.Active = false
-    marker.Visible = false
-    marker.ZIndex = 100
-    marker.Parent = gui
+local attackPointPreview = Instance.new("Frame")
+attackPointPreview.Name = "TouchPreview_Attack"
+attackPointPreview.AnchorPoint = Vector2.new(0.5, 0.5)
+attackPointPreview.Size = UDim2.fromOffset(30, 20)
+attackPointPreview.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+attackPointPreview.BackgroundTransparency = 0.12
+attackPointPreview.BorderColor3 = Color3.fromRGB(255, 220, 80)
+attackPointPreview.BorderSizePixel = 2
+attackPointPreview.Active = false
+attackPointPreview.Visible = false
+attackPointPreview.ZIndex = 100
+attackPointPreview.Parent = gui
 
-    local markerText = Instance.new("TextLabel")
-    markerText.Size = UDim2.fromScale(1, 1)
-    markerText.BackgroundTransparency = 1
-    markerText.Text = spec[2]
-    markerText.TextColor3 = Color3.new(1, 1, 1)
-    markerText.Font = Enum.Font.Code
-    markerText.TextSize = 10
-    markerText.Active = false
-    markerText.ZIndex = 101
-    markerText.Parent = marker
-    touchpointPreview[spec[1]] = marker
+local attackPointPreviewText = Instance.new("TextLabel")
+attackPointPreviewText.Size = UDim2.fromScale(1, 1)
+attackPointPreviewText.BackgroundTransparency = 1
+attackPointPreviewText.Text = "ATK"
+attackPointPreviewText.TextColor3 = Color3.new(1, 1, 1)
+attackPointPreviewText.Font = Enum.Font.Code
+attackPointPreviewText.TextSize = 10
+attackPointPreviewText.Active = false
+attackPointPreviewText.ZIndex = 101
+attackPointPreviewText.Parent = attackPointPreview
+
+local function refreshAttackPointPreview()
+    local point = RF.attackPoint()
+    attackPointPreview.Position = UDim2.fromOffset(point.X, point.Y)
 end
 
-local function refreshTouchpointPreview()
-    for _, spec in ipairs(touchpointPreviewSpecs) do
-        local marker = touchpointPreview[spec[1]]
-        local point = RF.mobilePoint(spec[1])
-        marker.Position = UDim2.fromOffset(point.X, point.Y)
-    end
-end
-
-local function setTouchpointPreviewVisible(visible)
-    for _, marker in pairs(touchpointPreview) do marker.Visible = visible end
+local function setAttackPointPreviewVisible(visible)
+    attackPointPreview.Visible = visible
     if visible then
-        refreshTouchpointPreview()
-        if not RS.MobileOffsetPreviewConnection then
-            RS.MobileOffsetPreviewConnection = RunService.RenderStepped:Connect(refreshTouchpointPreview)
+        refreshAttackPointPreview()
+        if not RS.AttackOffsetPreviewConnection then
+            RS.AttackOffsetPreviewConnection = RunService.RenderStepped:Connect(refreshAttackPointPreview)
         end
-    elseif RS.MobileOffsetPreviewConnection then
-        RS.MobileOffsetPreviewConnection:Disconnect()
-        RS.MobileOffsetPreviewConnection = nil
+    elseif RS.AttackOffsetPreviewConnection then
+        RS.AttackOffsetPreviewConnection:Disconnect()
+        RS.AttackOffsetPreviewConnection = nil
     end
 end
 
-local function validOffsetFromText(value)
+local function validAttackOffsetFromText(value)
     local parsed = tonumber(value)
     if not parsed or parsed ~= parsed or math.abs(parsed) > 10000 then return nil end
     return parsed
 end
 
-local function describeOffset(value, prefix)
+local function describeAttackOffset(value, prefix)
     if value > 0 then return string.format("%s%.1f PX UP", prefix or "", value) end
     if value < 0 then return string.format("%s%.1f PX DOWN", prefix or "", math.abs(value)) end
     return (prefix or "") .. "0 PX"
@@ -4486,37 +3995,37 @@ offsetBox.Focused:Connect(function()
     offsetStatus.Text = "LIVE PREVIEW"
     offsetStatus.TextColor3 = Color3.fromRGB(255, 225, 120)
     offsetBox.BorderColor3 = Color3.fromRGB(255, 220, 80)
-    setTouchpointPreviewVisible(true)
+    setAttackPointPreviewVisible(true)
 end)
 
 offsetBox:GetPropertyChangedSignal("Text"):Connect(function()
     if not offsetBox:IsFocused() then return end
-    local parsed = validOffsetFromText(offsetBox.Text)
+    local parsed = validAttackOffsetFromText(offsetBox.Text)
     if parsed then
-        RS.MobileYOffsetPx = parsed
-        offsetStatus.Text = describeOffset(parsed, "LIVE: ")
-        refreshTouchpointPreview()
+        RS.AttackYOffsetPx = parsed
+        offsetStatus.Text = describeAttackOffset(parsed, "LIVE: ")
+        refreshAttackPointPreview()
     end
 end)
 
 offsetBox.FocusLost:Connect(function()
-    local parsed = validOffsetFromText(offsetBox.Text)
+    local parsed = validAttackOffsetFromText(offsetBox.Text)
     if parsed then
-        RS.MobileYOffsetPx = parsed
+        RS.AttackYOffsetPx = parsed
     else
-        offsetBox.Text = tostring(RS.MobileYOffsetPx or 0)
+        offsetBox.Text = tostring(RS.AttackYOffsetPx or 0)
     end
-    offsetBox.Text = tostring(RS.MobileYOffsetPx or 0)
-    setTouchpointPreviewVisible(false)
+    offsetBox.Text = tostring(RS.AttackYOffsetPx or 0)
+    setAttackPointPreviewVisible(false)
     offsetBox.BorderColor3 = Color3.fromRGB(120, 120, 120)
-    local saved, saveError = RF.saveMobileLayout()
+    local saved, saveError = RF.saveAttackYOffset()
     if saved then
         offsetStatus.Text = "SAVED FOR REJOIN"
         offsetStatus.TextColor3 = Color3.fromRGB(140, 220, 150)
     else
         offsetStatus.Text = "SAVE UNAVAILABLE"
         offsetStatus.TextColor3 = Color3.fromRGB(240, 150, 120)
-        if saveError then warn("[TSB AI] touch offset save failed: " .. tostring(saveError)) end
+        if saveError then warn("[TSB AI] attack offset save failed: " .. tostring(saveError)) end
     end
 end)
 
@@ -4592,19 +4101,11 @@ local function disableAI(removeGui)
         if RS.TeleportConnection then RS.TeleportConnection:Disconnect() end
         -- R15: a re-executed copy must not leave this one running
         if RS.HeartbeatConnection then RS.HeartbeatConnection:Disconnect() end
-        RS.LeaderboardWatch = false
-        RS.ToolWatch = false
-        if RS.Spoof then RS.Spoof.active = false end
-        if RS.ButtonCacheReset then RS.ButtonCacheReset:Disconnect() end
-        if RS.MobileOffsetPreviewConnection then
-            RS.MobileOffsetPreviewConnection:Disconnect()
-            RS.MobileOffsetPreviewConnection = nil
+        if RS.AttackOffsetPreviewConnection then
+            RS.AttackOffsetPreviewConnection:Disconnect()
+            RS.AttackOffsetPreviewConnection = nil
         end
-        pcall(function() RunService:UnbindFromRenderStep("TSBAIMobileControl") end)
-        if Humanoid then pcall(function() Humanoid.AutoRotate = true end) end
-        for name in pairs(RS.MobileHeld) do RF.mobileTouch(name, Enum.UserInputState.End) end
-        RS.MobileHeld = {}
-        RS.VirtualKeys = {}
+        RS.LeaderboardWatch = false
         RS.MobileWatch = false
         if RS.LeaderboardRespawnConnection then RS.LeaderboardRespawnConnection:Disconnect() end
         if RS.CharacterAddedConnection then RS.CharacterAddedConnection:Disconnect() end
@@ -4735,7 +4236,7 @@ function RF.movesText()
 end
 
 RS.HeartbeatConnection = RunService.Heartbeat:Connect(function()
-    local attackPoint = ATTACK_BUTTON.AbsoluteCenter + ATTACK_BUTTON.InputOffset
+    local attackPoint = RF.attackPoint()
     local pointText = string.format("%d,%d", attackPoint.X, attackPoint.Y)
     local targetDistance = 0
     if CurrentTarget and Root and CurrentTarget.Character then
@@ -4751,7 +4252,7 @@ RS.HeartbeatConnection = RunService.Heartbeat:Connect(function()
     local shownLock = RF.threatLockActive() and RS.ThreatLock
     local lockText = shownLock and (shownLock.kind .. (shownLock.rule.counter and "*CTR" or "")) or "-"
     status.Text = string.format(
-        "TSB M1 DASH AI MOBILE M6\nSTATE: %s\nTARGET: %s D:%d M1:%d\nTARGET STATE: %s  LOCK: %s\nTEAM: %s  ALLIES ON TGT: %d\nREAD: %.2fs  PERSIST: %s\nMOVES: %s",
+        "TSB M1 + DASH AI MK.1 R23\nSTATE: %s\nTARGET: %s D:%d M1:%d\nTARGET STATE: %s  LOCK: %s\nTEAM: %s  ALLIES ON TGT: %d\nREAD: %.2fs  PERSIST: %s\nMOVES: %s",
         State, CurrentTarget and CurrentTarget.DisplayName or "none", targetDistance, CurrentM1Stage,
         targetBlockText, lockText, role, focus, RS.BlockDropWindow, CONFIG.PersistStatus, RF.movesText())
     if not CONFIG.Enabled then return end
@@ -5386,7 +4887,7 @@ RS.MobileWatch = true
 task.spawn(function()
     local wasDead, respawnedAt = false, nil
     while RS.MobileWatch do
-        if CONFIG.MobileControlsOnReset and not RF.spoofActive()
+        if CONFIG.MobileControlsOnReset
             and (CONFIG.Enabled or RS.Starting or RS.DeathHandled or RS.Rejoining) then
             local character = LocalPlayer.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -5408,7 +4909,7 @@ task.spawn(function()
 end)
 
 function RF.startMobileScheme()
-    if not CONFIG.MobileControlsOnReset or RF.spoofActive() then return function() end end
+    if not CONFIG.MobileControlsOnReset then return function() end end
     local running = true
     task.spawn(function()
         while running do
@@ -5456,7 +4957,7 @@ function RF.resetThenEnable(isAuto)
     end
     task.wait(CONFIG.MobileHoldAfterSpawn)
     stopMobile()
-    if CONFIG.MobileControlsOnReset and not RF.spoofActive() and not RF.mobileSchemeActive() then
+    if CONFIG.MobileControlsOnReset and not RF.mobileSchemeActive() then
         warn("[TSB AI] touch input did not register; mobile buttons may be missing")
     end
     task.wait(CONFIG.AutoEnableDelay)
@@ -5483,66 +4984,6 @@ function RF.hideLeaderboard()
         end
     end)
 end
-
-if RF.installTouchSpoof() then
-    print("[TSB AI mobile] touch input spoof active")
-else
-    warn("[TSB AI mobile] executor lacks hookmetamethod/checkcaller: using touch events (pointer) instead")
-end
-RS.ButtonCacheReset = LocalPlayer.CharacterAdded:Connect(function()
-    RS.ButtonCache = {}
-    RS.ButtonKind = {}
-    RF.P.resetCache()
-end)
-
--- ===================== MOBILE: control loop =====================
--- Runs after Roblox's control module each frame, so our Move wins.
-RS.AutoRotateTaken = false
-RunService:BindToRenderStep("TSBAIMobileControl", Enum.RenderPriority.Character.Value + 1, function()
-    local humanoid, root = Humanoid, Root
-    if not CONFIG.Enabled or not humanoid or not root or humanoid.Health <= 0 then
-        if RS.AutoRotateTaken and humanoid then
-            pcall(function() humanoid.AutoRotate = true end)
-            RS.AutoRotateTaken = false
-        end
-        return
-    end
-    -- identical to the keyboard module: (D - A, 0, S - W), camera-relative
-    local keys = RS.VirtualKeys
-    local x = (keys[Enum.KeyCode.D] and 1 or 0) - (keys[Enum.KeyCode.A] and 1 or 0)
-    local z = (keys[Enum.KeyCode.S] and 1 or 0) - (keys[Enum.KeyCode.W] and 1 or 0)
-    humanoid:Move(Vector3.new(x, 0, z), true)
-    if CONFIG.EmulateShiftLock and not humanoid.PlatformStand and not isRagdolled(Character) then
-        local camera = workspace.CurrentCamera
-        local look = camera and flat(camera.CFrame.LookVector)
-        if look and look.Magnitude > 0.05 then
-            humanoid.AutoRotate = false
-            RS.AutoRotateTaken = true
-            root.CFrame = CFrame.lookAt(root.Position, root.Position + look.Unit)
-        end
-    end
-end)
-
--- External tool watchdog: a tool held while no move is in progress gets
--- unequipped after a short grace period.
-RS.ToolWatch = true
-task.spawn(function()
-    local seenAt
-    while RS.ToolWatch do
-        if CONFIG.Enabled and CONFIG.ToolWatchdog and not RS.MoveInProgress
-            and os.clock() - (RS.MoveEndedAt or 0) > CONFIG.ToolUnexpectedGrace
-            and RF.toolEquipped() then
-            seenAt = seenAt or os.clock()
-            if os.clock() - seenAt >= CONFIG.ToolUnexpectedGrace and Humanoid then
-                pcall(function() Humanoid:UnequipTools() end)
-                seenAt = nil
-            end
-        else
-            seenAt = nil
-        end
-        task.wait(0.1)
-    end
-end)
 
 RS.LeaderboardWatch = true
 task.spawn(function()
